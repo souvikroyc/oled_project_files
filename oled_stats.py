@@ -1,81 +1,102 @@
-#oled_project
-#author : souvik roychoudhury
-#version: 4.1
-#feature: with welcome screen || it has only IP, CPU, Temp, RAM and Disk information.
-
 import time
 import subprocess
 import psutil
+import glob
+import signal
+import sys
+import os
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
 from luma.oled.device import ssd1306
-from PIL import ImageFont, ImageDraw
+from PIL import ImageFont
 
 # OLED setup
 serial = i2c(port=1, address=0x3C)  # Adjust the I2C address if needed
 device = ssd1306(serial, width=128, height=64)
 
 # Load fonts
-default_font = ImageFont.load_default()  # Small default font
-ip_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)  # Larger font for IP
-welcome_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)  # Font for welcome message
+default_font = ImageFont.load_default()
+ip_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
 
-def display_welcome_message():
-    with canvas(device) as draw:
-        welcome_message = "Welcome to Raspi \nHome Media Center"
-        
-        # Calculate text size and position to center the text
-        text_width, text_height = draw.textbbox((0, 0), welcome_message, font=welcome_font)[2:]
-        text_x = (device.width - text_width) // 2
-        text_y = (device.height - text_height) // 2
-        
-        # Draw the welcome message centered
-        draw.multiline_text((text_x, text_y), welcome_message, font=welcome_font, fill="white", align="center")
-    
-    # Display the message for 10 seconds
-    time.sleep(10)
+# ---- Shutdown handler ----
+def shutdown_handler(signum, frame):
+    """Clear and power off OLED on shutdown/exit."""
+    try:
+        device.clear()
+        device.hide()   # sends 'display off' command (0xAE)
+    except Exception as e:
+        print(f"Error turning off OLED: {e}")
+    sys.exit(0)
 
+# Catch system signals (shutdown/reboot/ctrl+c)
+signal.signal(signal.SIGTERM, shutdown_handler)
+signal.signal(signal.SIGINT, shutdown_handler)
+
+# ---- System info functions ----
 def get_ip_address():
     cmd = "hostname -I | cut -d' ' -f1"
     return subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
 
 def get_cpu_usage():
-    return psutil.cpu_percent(interval=1)
+    return psutil.cpu_percent(interval=0.5)
 
 def get_memory_usage():
     mem = psutil.virtual_memory()
-    return mem.percent, mem.used / (1024 * 1024 * 1024), mem.total / (1024 * 1024 * 1024)
+    return mem.percent, mem.used / (1024**3), mem.total / (1024**3)
 
-def get_temperature():
-    temp = subprocess.check_output(["vcgencmd", "measure_temp"]).decode()
-    return temp.replace("temp=", "").strip()
+def get_temperature_f():
+    """Return CPU temperature in Fahrenheit as a string like '120.3°F'."""
+    try:
+        raw = subprocess.check_output(["vcgencmd", "measure_temp"]).decode()
+        celsius = float(raw.split('=')[1].split("'")[0])
+        fahrenheit = celsius * 9 / 5 + 32
+        return f"{fahrenheit:.1f}°F"
+    except Exception:
+        return "N/A"
 
 def get_disk_usage():
     disk = psutil.disk_usage('/')
-    return disk.percent, disk.used / (1024 * 1024 * 1024), disk.total / (1024 * 1024 * 1024)
+    return disk.percent, disk.used / (1024**3), disk.total / (1024**3)
 
-# Display the welcome message at startup
-display_welcome_message()
+def get_fan_speed_with_percent(max_rpm=6500):
+    """
+    Returns a string like '2450 RPM (58%)'.
+    `max_rpm` should be set to your fan's max RPM (consult spec, e.g., 4200 RPM).
+    """
+    try:
+        paths = glob.glob("/sys/devices/platform/cooling_fan/hwmon/*/fan1_input")
+        if not paths:
+            return "N/A"
 
-# Main loop for displaying system stats
-while True:
-    ip_address = get_ip_address()
-    cpu_usage = get_cpu_usage()
-    memory_usage_percent, memory_used, memory_total = get_memory_usage()
-    temperature = get_temperature()
-    disk_usage_percent, disk_used, disk_total = get_disk_usage()
+        with open(paths[0], "r") as f:
+            rpm_str = f.read().strip()
+        rpm = int(rpm_str)
 
-    with canvas(device) as draw:
-        # Draw IP address with larger font
-        draw.text((0, 0), f"IP: {ip_address}", font=ip_font, fill="yellow")
-        
-        # Combine CPU and Temperature on one line
-        draw.text((0, 15), f"CPU: {cpu_usage}%  Temp: {temperature}", font=default_font, fill="blue")
+        percent = min(int(rpm / max_rpm * 100), 100)
+        return f"{rpm} RPM ({percent}%)"
+    except Exception:
+        return "N/A"
 
-        # Memory Usage in GB with percentage
-        draw.text((0, 30), f"RAM: {memory_used:.2f}/{memory_total:.2f}GB ({memory_usage_percent}%)", font=default_font, fill="blue")
-        
-        # Disk Usage in GB with percentage
-        draw.text((0, 45), f"Disk: {disk_used:.2f}/{disk_total:.2f}GB ({disk_usage_percent}%)", font=default_font, fill="blue")
+# ---- Main loop ----
+try:
+    while True:
+        ip_address = get_ip_address()
+        cpu_usage = get_cpu_usage()
+        mem_percent, mem_used, mem_total = get_memory_usage()
+        temperature_f = get_temperature_f()
+        disk_percent, disk_used, disk_total = get_disk_usage()
+        fan_speed = get_fan_speed_with_percent()
 
-    time.sleep(1)
+        with canvas(device) as draw:
+            draw.text((0, 0),  "Raspberry Pi Stats:", font=ip_font, fill="white")
+            draw.text((0, 15), f"CPU:{cpu_usage:.1f}% Temp:{temperature_f}", font=default_font, fill="white")
+            draw.text((0, 25), f"RAM:{mem_used:.2f}/{mem_total:.2f}GB",      font=default_font, fill="white")
+            draw.text((0, 35), f"Disk:{disk_used:.2f}/{disk_total:.2f}GB",   font=default_font, fill="white")
+            draw.text((0, 45), f"Fan: {fan_speed}",                          font=default_font, fill="white")
+            draw.text((0, 55), f"IP: {ip_address}",                          font=default_font, fill="white")
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    shutdown_handler(None, None)
+
